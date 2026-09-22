@@ -1,0 +1,40 @@
+import os
+import joblib
+import pandas as pd
+
+MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "models",
+    "saved_model",
+    "anomaly_model.pkl"
+)
+
+model = joblib.load(MODEL_PATH)
+
+FEATURES = [
+    "tilt_x",
+    "tilt_y",
+    "displacement_mm",
+    "vibration",
+    "temperature",
+    "humidity"
+]
+
+
+def predict_anomaly(data: dict):
+
+    df = pd.DataFrame([data])
+
+    for feature in FEATURES:
+        if feature not in df.columns:
+            raise ValueError(f"Missing feature: {feature}")
+
+    X = df[FEATURES]
+
+    prediction = model.predict(X)[0]
+
+    return {
+        "prediction": int(prediction),
+        "status": "ANOMALY" if prediction == 1 else "NORMAL"
+    }
