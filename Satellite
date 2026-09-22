@@ -1,0 +1,138 @@
+"""
+Satellite & InSAR Deformation Preprocessing & Validation Engine
+Smart Mine — Subsidence Sentinel
+"""
+
+from datetime import datetime
+from typing import Dict, Any, Tuple, List
+
+
+def standardize_satellite_zone(zone_raw: Any) -> str:
+    """Normalizes zone name."""
+    if not zone_raw:
+        return "ZONE-B"
+    z = str(zone_raw).strip().upper()
+    if "A" in z:
+        return "ZONE-A"
+    if "C" in z:
+        return "ZONE-C"
+    return "ZONE-B"
+
+
+def clean_satellite_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Cleans, casts types, and validates incoming InSAR satellite deformation data.
+    """
+    def parse_float(val, default=0.0):
+        try:
+            return float(val) if val is not None else default
+        except (ValueError, TypeError):
+            return default
+
+    lat = parse_float(payload.get("latitude"), 23.7760)
+    lon = parse_float(payload.get("longitude"), 86.4240)
+    zone = standardize_satellite_zone(payload.get("zone") or payload.get("zone_id"))
+
+    # Cumulative displacement (mm)
+    disp = parse_float(payload.get("displacement", payload.get("displacement_mm", payload.get("los_displacement_mm"))), 0.0)
+
+    # Deformation velocity (mm/year or mm/day)
+    vel = parse_float(payload.get("deformation_velocity", payload.get("velocity_mm_year", payload.get("velocity"))), 0.0)
+
+    # Trend (SUBSIDING, UPLIFT, STABLE)
+    trend_raw = str(payload.get("deformation_trend") or payload.get("trend") or "").strip().upper()
+    if not trend_raw:
+        if vel < -5.0 or disp < -4.0:
+            trend_raw = "SUBSIDING"
+        elif vel > 5.0 or disp > 4.0:
+            trend_raw = "UPLIFT"
+        else:
+            trend_raw = "STABLE"
+
+    # Satellite mission source (e.g., Sentinel-1A, TerraSAR-X, ALOS-2, InSAR-CSK)
+    source = str(payload.get("satellite") or payload.get("source") or "Sentinel-1 (InSAR)").strip()
+
+    # Confidence (normalize 0-100 to 0.0-1.0 if > 1.0)
+    conf = parse_float(payload.get("confidence"), 0.92)
+    if conf > 1.0:
+        conf = round(conf / 100.0, 4)
+    conf = max(0.0, min(1.0, conf))
+
+    # Timestamp
+    raw_ts = payload.get("timestamp")
+    if not raw_ts:
+        timestamp = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+        created_at_iso = datetime.now().isoformat()
+    else:
+        timestamp = str(raw_ts)
+        created_at_iso = datetime.now().isoformat()
+
+    return {
+        "zone_id": zone,
+        "zone": zone,
+        "satellite_source": source,
+        "latitude": round(lat, 6),
+        "longitude": round(lon, 6),
+        "displacement": round(disp, 2),
+        "deformation_velocity": round(vel, 2),
+        "deformation_trend": trend_raw,
+        "confidence": round(conf, 3),
+        "timestamp": timestamp,
+        "created_at_iso": created_at_iso
+    }
+
+
+def validate_satellite_data(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Validates satellite InSAR data consistency.
+    """
+    warnings = []
+
+    # Geographic boundary check (Jharia/Raniganj coalfield approx bounds)
+    if not (22.0 <= data["latitude"] <= 25.0 and 84.0 <= data["longitude"] <= 88.0):
+        warnings.append(f"Satellite coordinates outside coalfield operational area: {data['latitude']}N, {data['longitude']}E")
+
+    # Plausible velocity check (+/- 500 mm/year)
+    if abs(data["deformation_velocity"]) > 500.0:
+        warnings.append(f"Extreme InSAR deformation velocity: {data['deformation_velocity']} mm/year")
+
+    # Confidence check
+    if data["confidence"] < 0.40:
+        warnings.append(f"Low InSAR coherence/confidence score: {data['confidence'] * 100:.1f}%")
+
+    return len(warnings) == 0, warnings
+
+
+def normalize_satellite_metrics(data: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Calculates standardized daily subsidence rates and normalized satellite hazard indices [0.0, 1.0].
+    """
+    # Convert annual velocity to daily velocity (mm/day)
+    annual_vel = data["deformation_velocity"]
+    daily_velocity = annual_vel / 365.25
+
+    # Critical subsidence thresholds (DGMS slope stability benchmarks)
+    # Velocity < -25 mm/yr is moderate warning, < -50 mm/yr is critical
+    abs_sub_rate = abs(annual_vel) if annual_vel < 0 or data["deformation_trend"] == "SUBSIDING" else 0.0
+
+    # Normalized hazard index: 0 mm/yr -> 0.0, 60 mm/yr -> 1.0
+    sat_hazard_index = min(1.0, max(0.0, abs_sub_rate / 60.0))
+    weighted_hazard = sat_hazard_index * data["confidence"]
+
+    return {
+        "daily_subsidence_rate_mm": round(daily_velocity, 4),
+        "annual_subsidence_rate_mm": round(annual_vel, 2),
+        "satellite_hazard_index": round(sat_hazard_index, 4),
+        "weighted_confidence_hazard": round(weighted_hazard, 4)
+    }
+
+
+def calculate_satellite_confidence(coherence: float = 0.85, resolution_meters: float = 10.0) -> float:
+    """Calculates weighted radar confidence score [0.0 - 1.0]."""
+    res_factor = max(0.5, 1.0 - (resolution_meters / 100.0))
+    return round(min(1.0, max(0.1, coherence * res_factor)), 3)
+
+
+# Aliases for flexible service integration
+validate_satellite_payload = clean_satellite_payload
+
