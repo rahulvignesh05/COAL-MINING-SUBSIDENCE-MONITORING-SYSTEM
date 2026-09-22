@@ -1,0 +1,47 @@
+import numpy as np
+
+from models.anomaly_model import train_model, predict_anomaly
+
+
+def prepare_features(data):
+    """
+    Convert sensor data into the feature format
+    expected by the AI model.
+    """
+
+    features = [
+        data["vibration_sw1"],
+        data["vibration_sw2"],
+        data["vibration_sw3"],
+        data["acceleration"],
+        data["roll"],
+        data["pitch"],
+        data["gyro"],
+        data["temperature"],
+        data["humidity"],
+        data["subsidence_rate"]
+    ]
+
+    return np.array(features).reshape(1, -1)
+
+
+def analyze_sensor_data(model, data):
+    """
+    Analyze one new sensor observation.
+    """
+
+    features = prepare_features(data)
+
+    prediction, score = predict_anomaly(model, features)
+
+    if prediction[0] == -1:
+        classification = "ANOMALY"
+    else:
+        classification = "NORMAL"
+
+    return {
+        "node_id": data["node_id"],
+        "zone_id": data["zone_id"],
+        "anomaly_score": float(score[0]),
+        "classification": classification
+    }
