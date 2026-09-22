@@ -1,0 +1,150 @@
+"""
+IoT + Satellite Data Fusion Preprocessing
+Smart Mine — Subsidence Sentinel
+"""
+
+from typing import Dict, Any, List, Optional
+from .sensor import standardize_zone
+
+
+def align_spatial_temporal(
+    sensor_readings: List[Dict[str, Any]],
+    satellite_readings: List[Dict[str, Any]],
+    zone_id: str
+) -> Dict[str, Any]:
+    """
+    Spatially groups and temporally aggregates IoT sensor and Satellite InSAR data for a zone.
+    """
+    target_zone = standardize_zone(zone_id)
+    zone_sensors = [s for s in sensor_readings if standardize_zone(s.get("zone_id") or s.get("zone")) == target_zone]
+    zone_satellite = [s for s in satellite_readings if standardize_zone(s.get("zone_id") or s.get("zone")) == target_zone]
+
+
+    # Aggregate IoT metrics
+    if zone_sensors:
+        avg_disp = sum(s.get("displacement", 0.0) for s in zone_sensors) / len(zone_sensors)
+        max_disp = max(s.get("displacement", 0.0) for s in zone_sensors)
+        max_tilt = max(max(abs(s.get("tilt_x", 0.0)), abs(s.get("tilt_y", 0.0))) for s in zone_sensors)
+        max_vib = max(s.get("vibration", 0.0) for s in zone_sensors)
+        max_crack = max(s.get("crack_width", 0.0) for s in zone_sensors)
+        cracks_active = any(s.get("crack_status", "NONE") != "NONE" for s in zone_sensors)
+        sensor_count = len(zone_sensors)
+        latest_sensor_ts = zone_sensors[0].get("timestamp", "Recent")
+    else:
+        avg_disp = max_disp = max_tilt = max_vib = max_crack = 0.0
+        cracks_active = False
+        sensor_count = 0
+        latest_sensor_ts = "No IoT data"
+
+    # Aggregate Satellite InSAR metrics
+    if zone_satellite:
+        latest_sat = zone_satellite[0]
+        sat_disp = latest_sat.get("displacement", 0.0)
+        sat_vel = latest_sat.get("deformation_velocity", 0.0)
+        sat_conf = latest_sat.get("confidence", 0.90)
+        sat_trend = latest_sat.get("deformation_trend", "STABLE")
+        sat_source = latest_sat.get("satellite_source", "Sentinel-1")
+        sat_ts = latest_sat.get("timestamp", "Recent")
+    else:
+        sat_disp = sat_vel = 0.0
+        sat_conf = 0.85
+        sat_trend = "STABLE"
+        sat_source = "Sentinel-1 (Simulated Baseline)"
+        sat_ts = "Baseline pass"
+
+    return {
+        "zone_id": zone_id,
+        "iot": {
+            "sensor_count": sensor_count,
+            "avg_displacement_mm": round(avg_disp, 2),
+            "max_displacement_mm": round(max_disp, 2),
+            "max_tilt_deg": round(max_tilt, 2),
+            "max_vibration_g": round(max_vib, 2),
+            "max_crack_mm": round(max_crack, 2),
+            "cracks_active": cracks_active,
+            "latest_timestamp": latest_sensor_ts
+        },
+        "satellite": {
+            "displacement_mm": round(sat_disp, 2),
+            "velocity_mm_per_yr": round(sat_vel, 2),
+            "confidence": round(sat_conf, 3),
+            "trend": sat_trend,
+            "source": sat_source,
+            "latest_timestamp": sat_ts
+        }
+    }
+
+
+def compute_concordance(iot: Dict[str, Any], satellite: Dict[str, Any]) -> float:
+    """
+    Evaluates multi-source agreement between ground IoT readings and Satellite InSAR observations.
+    Returns concordance score [0.0, 1.0].
+    """
+    # 1. IoT hazard indicator (displacement > 4.0mm or tilt > 2.5° or crack active)
+    iot_detects_motion = (
+        iot["max_displacement_mm"] > 4.0 or
+        iot["max_tilt_deg"] > 2.5 or
+        iot["max_vibration_g"] > 3.0 or
+        iot["cracks_active"]
+    )
+
+    # 2. Satellite hazard indicator (velocity < -20 mm/yr or displacement < -4mm or trend == SUBSIDING)
+    sat_detects_motion = (
+        satellite["velocity_mm_per_yr"] < -20.0 or
+        abs(satellite["displacement_mm"]) > 4.0 or
+        satellite["trend"] == "SUBSIDING"
+    )
+
+    if iot_detects_motion and sat_detects_motion:
+        # High concordance: both ground and orbital radars corroborate ground subsidence
+        base_concordance = 0.88 + (0.10 * satellite["confidence"])
+    elif not iot_detects_motion and not sat_detects_motion:
+        # High concordance: both confirm stability
+        base_concordance = 0.94
+    else:
+        # Divergence: one source indicates hazard while the other does not (e.g. localized bench vs regional slope)
+        base_concordance = 0.55
+
+    return round(min(1.0, max(0.0, base_concordance)), 3)
+
+
+def fuse_zone_telemetry(
+    zone_id: str,
+    sensor_readings: List[Dict[str, Any]],
+    satellite_readings: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """
+    Unified multi-source fusion for a single mine zone.
+    Combines ground IoT sensor arrays and orbital InSAR satellite passes into
+    a fused state and feature dictionary ready for prediction and risk modeling.
+    """
+    aligned = align_spatial_temporal(sensor_readings, satellite_readings, zone_id)
+    iot = aligned["iot"]
+    satellite = aligned["satellite"]
+    concordance = compute_concordance(iot, satellite)
+
+    features = {
+        "displacement": iot["max_displacement_mm"],
+        "tilt": iot["max_tilt_deg"],
+        "vibration": iot["max_vibration_g"],
+        "crack_width": iot["max_crack_mm"],
+        "cracks_active": iot["cracks_active"],
+        "satellite_velocity": satellite["velocity_mm_per_yr"],
+        "satellite_displacement": satellite["displacement_mm"],
+        "concordance": concordance,
+        "coherence": satellite["confidence"]
+    }
+
+    return {
+        "zone_id": zone_id,
+        "zone": zone_id,
+        "features": features,
+        "ground_summary": iot,
+        "satellite_summary": satellite,
+        "fusion_meta": {
+            "concordance_factor": concordance,
+            "sensor_nodes_aligned": iot["sensor_count"],
+            "satellite_source": satellite["source"]
+        }
+    }
+
