@@ -8,6 +8,20 @@ The system combines **IoT sensors, wireless communication, Artificial Intelligen
 
 ---
 
+## 📊 Monitoring Dashboard
+
+<p align="center">
+  <img src="assets/dashboard.png" width="1000">
+</p>
+
+<p align="center">
+  <b>Smart Mine Sentinel – Real-Time Mine Subsidence Monitoring Dashboard</b>
+</p>
+
+The dashboard provides a centralized interface for monitoring mine conditions, sensor telemetry, satellite-based deformation, AI anomaly scores, active alerts, and zone-wise mine risk levels.
+
+---
+
 ## 📌 Problem Statement
 
 **SIH26025 – Development of an AI-enabled Low Cost Real Time Mine Subsidence Monitoring, Prediction and Early Warning System for Underground Coal Mines in India**
@@ -37,9 +51,11 @@ Our proposed system addresses this challenge through an integrated monitoring pl
 ## 🚀 Key Features
 
 ### 📡 Real-Time IoT Monitoring
+
 Collects data from multiple sensors installed around the monitoring zone.
 
 ### 📐 Structural Monitoring
+
 Monitors parameters such as:
 
 - Tilt
@@ -51,18 +67,23 @@ Monitors parameters such as:
 - Humidity
 
 ### 📷 AI-Based Crack Detection
+
 ESP32-CAM can capture images of structural surfaces for crack detection and monitoring of crack growth.
 
 ### 🛰️ Satellite InSAR Monitoring
+
 Satellite-based deformation data can be integrated to analyse long-term ground movement and surface deformation.
 
 ### 🤖 AI-Based Anomaly Detection
+
 Machine Learning models analyse sensor and environmental data to identify abnormal patterns and classify potential risk conditions.
 
 ### 🗺️ GIS-Based Visualization
+
 Monitoring locations and deformation information can be visualized geographically for easier interpretation.
 
 ### 📊 Real-Time Dashboard
+
 A web-based dashboard provides:
 
 - Live sensor readings
@@ -74,6 +95,7 @@ A web-based dashboard provides:
 - Warning alerts
 
 ### ⚠️ Early Warning System
+
 The system can classify monitoring conditions into different risk levels and generate alerts when abnormal behaviour is detected.
 
 ---
@@ -89,7 +111,6 @@ The system can classify monitoring conditions into different risk levels and gen
              │                 │                 │
              ▼                 ▼                 ▼
         IoT Sensors        ESP32-CAM       Satellite Data
-             │                 │                 │
              │                 │                 │
              └─────────────────┼─────────────────┘
                                │
