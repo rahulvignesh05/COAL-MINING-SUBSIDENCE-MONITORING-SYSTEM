@@ -1,0 +1,180 @@
+/*
+  NAHIDA: AI-Enabled Smart Mine Subsidence Monitoring & Early-Warning System
+  SIH Problem ID: SIH26025
+  Sample ESP32 Sensor Edge Node Firmware
+
+  Target Hardware:
+  - ESP32-WROOM-32 Microcontroller
+  - MPU6500 (6-Axis IMU for Tilt & 3-Axis Acceleration via I2C)
+  - SW-420 (3x Vibration Sensor Modules on digital interrupt/ADC pins)
+  - DHT11 (Temperature & Relative Humidity Sensor)
+  - NEO-6M (GNSS / GPS Module via Hardware Serial 2)
+  - DS3231 (High-Precision RTC via I2C)
+  - MicroSD Card Module (SPI Interface for Local Offline Blackbox Logging)
+
+  Telemetry Destination:
+  HTTP POST http://<SERVER_HOST>:8000/api/sensors/data
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <ArduinoJson.h>    // Requires ArduinoJson v6 or v7
+
+// ==========================================
+// CONFIGURATION & CREDENTIALS (PLACEHOLDERS)
+// ==========================================
+const char* WIFI_SSID = "YOUR_MINE_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_MINE_WIFI_PASSWORD";
+
+// Central Ingestion Server URL
+const char* SERVER_URL = "http://192.168.1.100:8000/api/sensors/data";
+
+// Node Identity
+const char* NODE_ID = "NAHIDA-A01";
+const char* ZONE = "ZONE A";
+
+// Pin Assignments
+#define PIN_DHT 4
+#define PIN_SW420_Z1 32
+#define PIN_SW420_Z2 33
+#define PIN_SW420_Z3 35
+#define PIN_SD_CS 5
+
+// Transmission Cadence
+const unsigned long TRANSMISSION_INTERVAL_MS = 3500;
+unsigned long lastTransmissionTime = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("=========================================");
+  Serial.println("NAHIDA ESP32 Edge Node Initializing...");
+  Serial.println("=========================================");
+
+  // Initialize I2C Bus for MPU6500 and DS3231
+  Wire.begin(21, 22);
+
+  // Initialize Vibration Sensor Pins
+  pinMode(PIN_SW420_Z1, INPUT);
+  pinMode(PIN_SW420_Z2, INPUT);
+  pinMode(PIN_SW420_Z3, INPUT);
+
+  // Initialize SD Card for Offline Resilience
+  if (SD.begin(PIN_SD_CS)) {
+    Serial.println("[SD] MicroSD initialized. Offline backup logging enabled.");
+  } else {
+    Serial.println("[SD] Warning: SD card mount failed. Operating in RAM buffer mode.");
+  }
+
+  // Connect to Industrial Wi-Fi Network
+  Serial.print("[WIFI] Connecting to ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WIFI] Connected! IP Address: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n[WIFI] Initial connect timed out. Telemetry will be logged to SD.");
+  }
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastTransmissionTime >= TRANSMISSION_INTERVAL_MS) {
+    lastTransmissionTime = currentMillis;
+    processAndTransmitSensorData();
+  }
+}
+
+void processAndTransmitSensorData() {
+  // 1. Read Simulated / Actual MPU6500 Inclination (Degrees)
+  // In production: read raw registers ACCEL_XOUT, ACCEL_YOUT, ACCEL_ZOUT
+  float ax = 0.05, ay = 0.98, az = 0.15;
+  float tilt = atan2(sqrt(ax * ax + az * az), ay) * 180.0 / PI;
+
+  // 2. Read 3x SW-420 Vibration Sensitivities
+  int raw_vib1 = analogRead(PIN_SW420_Z1);
+  int raw_vib2 = analogRead(PIN_SW420_Z2);
+  int raw_vib3 = analogRead(PIN_SW420_Z3);
+  float vibration = (raw_vib1 / 4095.0) * 1.5; // Normalized peak ground vibration
+
+  // 3. Crack Displacement Gauge (Linear Potentiometer / LVDT ADC read)
+  float crack_displacement = 0.52; // mm
+
+  // 4. Environmental Telemetry (DHT11)
+  float temperature = 28.4;
+  float humidity = 62.0;
+
+  // 5. Battery Monitoring (Voltage divider on ADC)
+  float battery = 4.12;
+
+  // 6. Build ISO Timestamp (from DS3231 RTC)
+  String timestampStr = "2026-09-22T23:30:00Z";
+
+  // Construct JSON Payload (Exactly matching backend SensorDataCreate schema)
+  StaticJsonDocument<512> doc;
+  doc["node_id"] = NODE_ID;
+  doc["zone"] = ZONE;
+  doc["timestamp"] = timestampStr;
+  doc["tilt"] = round(tilt * 100.0) / 100.0;
+  doc["vibration"] = round(vibration * 1000.0) / 1000.0;
+  doc["crack_displacement"] = round(crack_displacement * 100.0) / 100.0;
+  doc["temperature"] = temperature;
+  doc["humidity"] = humidity;
+  doc["latitude"] = 23.7957;
+  doc["longitude"] = 86.4304;
+  doc["acceleration_x"] = ax;
+  doc["acceleration_y"] = ay;
+  doc["acceleration_z"] = az;
+  doc["vibration_zone_1"] = (raw_vib1 / 4095.0) * 1.5;
+  doc["vibration_zone_2"] = (raw_vib2 / 4095.0) * 1.5;
+  doc["vibration_zone_3"] = (raw_vib3 / 4095.0) * 1.5;
+  doc["battery"] = battery;
+  doc["gps_fix"] = true;
+  doc["imu_status"] = "OK";
+  doc["rtc_status"] = "SYNCED";
+  doc["sd_status"] = "READY";
+  doc["data_source"] = "ESP32";
+
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+
+  // Transmit via HTTP POST to FastAPI Backend
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(SERVER_URL);
+    http.addHeader("Content-Type", "application/json");
+
+    int httpResponseCode = http.POST(jsonPayload);
+    if (httpResponseCode > 0) {
+      Serial.printf("[HTTP] POST Success, Code: %d\n", httpResponseCode);
+    } else {
+      Serial.printf("[HTTP] POST Failed, Error: %s\n", http.errorToString(httpResponseCode).c_str());
+      logToSD(jsonPayload);
+    }
+    http.end();
+  } else {
+    Serial.println("[WIFI] Network disconnected. Storing packet in local SD buffer.");
+    logToSD(jsonPayload);
+    WiFi.reconnect();
+  }
+}
+
+void logToSD(const String& data) {
+  File logFile = SD.open("/telemetry_backup.jsonl", FILE_APPEND);
+  if (logFile) {
+    logFile.println(data);
+    logFile.close();
+  }
+}
