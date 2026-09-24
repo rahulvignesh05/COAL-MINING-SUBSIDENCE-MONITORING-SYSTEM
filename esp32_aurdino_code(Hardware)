@@ -1,0 +1,1065 @@
+/*
+  ============================================================
+  NAHIDA - AI-Enabled Smart Mine Subsidence Monitoring
+  SIH Problem ID: SIH26025
+
+  ESP32 Sensor Edge Node
+  + Wi-Fi
+  + HTTP/FastAPI
+  + LoRa Mesh Forwarding
+  + SD Offline Logging
+
+  Hardware:
+  - ESP32-WROOM-32
+  - MPU6500
+  - SW-420 x3
+  - DHT11
+  - NEO-6M GPS
+  - DS3231 RTC
+  - MicroSD
+  - SX1278 / Ra-02 LoRa
+
+  Communication Architecture:
+
+      NODE A
+        |
+        | LoRa
+        v
+      NODE B
+        |
+        | LoRa
+        v
+      GATEWAY
+        |
+        | Wi-Fi
+        v
+      FastAPI Server
+
+  ============================================================
+*/
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <ArduinoJson.h>
+#include <LoRa.h>
+
+// ============================================================
+// WIFI CONFIGURATION
+// ============================================================
+
+const char* WIFI_SSID = "YOUR_MINE_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_MINE_WIFI_PASSWORD";
+
+// FastAPI server
+const char* SERVER_URL =
+    "http://192.168.1.100:8000/api/sensors/data";
+
+// ============================================================
+// NODE CONFIGURATION
+// ============================================================
+
+// CHANGE THIS FOR EACH ESP32 NODE
+
+#define NODE_ID       "NAHIDA-A01"
+#define ZONE_NAME     "ZONE A"
+
+// Set true ONLY for the node connected to Wi-Fi/server
+#define IS_GATEWAY    false
+
+// ============================================================
+// PIN ASSIGNMENTS
+// ============================================================
+
+// DHT11
+#define PIN_DHT 4
+
+// SW-420
+#define PIN_SW420_Z1 32
+#define PIN_SW420_Z2 33
+#define PIN_SW420_Z3 35
+
+// SD Card
+#define PIN_SD_CS 5
+
+// ============================================================
+// LORA PINS - SX1278 / RA-02
+// ============================================================
+
+#define LORA_SCK   18
+#define LORA_MISO  19
+#define LORA_MOSI  23
+#define LORA_SS    27
+#define LORA_RST   14
+#define LORA_DIO0  26
+
+// LoRa frequency
+// Change according to your module/regulatory requirements.
+// SX1278 modules commonly use 433 MHz.
+#define LORA_FREQUENCY 433E6
+
+// ============================================================
+// TIMING
+// ============================================================
+
+const unsigned long TRANSMISSION_INTERVAL_MS = 3500;
+
+unsigned long lastTransmissionTime = 0;
+
+// ============================================================
+// MESH CONFIGURATION
+// ============================================================
+
+// Maximum number of hops a packet can travel
+#define MAX_HOPS 5
+
+// Used to avoid endlessly forwarding packets
+#define PACKET_HISTORY_SIZE 20
+
+String packetHistory[PACKET_HISTORY_SIZE];
+int historyIndex = 0;
+
+// ============================================================
+// FUNCTION DECLARATIONS
+// ============================================================
+
+void processAndTransmitSensorData();
+
+void sendLoRaPacket(const String& payload);
+
+void receiveLoRaPackets();
+
+void processLoRaPacket(String packet);
+
+void forwardLoRaPacket(String packet);
+
+void sendToServer(String payload);
+
+void logToSD(const String& data);
+
+bool packetAlreadySeen(String packetID);
+
+void rememberPacket(String packetID);
+
+String createPacketID();
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("=========================================");
+  Serial.println(" NAHIDA SMART MINE SENSOR NODE");
+  Serial.println(" LoRa Mesh + Wi-Fi + SD");
+  Serial.println("=========================================");
+
+  // ----------------------------------------------------------
+  // I2C
+  // ----------------------------------------------------------
+
+  Wire.begin(21, 22);
+
+  Serial.println("[I2C] Bus initialized");
+
+  // ----------------------------------------------------------
+  // SW-420
+  // ----------------------------------------------------------
+
+  pinMode(PIN_SW420_Z1, INPUT);
+  pinMode(PIN_SW420_Z2, INPUT);
+  pinMode(PIN_SW420_Z3, INPUT);
+
+  Serial.println("[VIBRATION] Sensors initialized");
+
+  // ----------------------------------------------------------
+  // SD CARD
+  // ----------------------------------------------------------
+
+  if (SD.begin(PIN_SD_CS)) {
+
+    Serial.println(
+      "[SD] MicroSD initialized successfully"
+    );
+
+  } else {
+
+    Serial.println(
+      "[SD] WARNING: SD initialization failed"
+    );
+  }
+
+  // ----------------------------------------------------------
+  // LORA
+  // ----------------------------------------------------------
+
+  SPI.begin(
+    LORA_SCK,
+    LORA_MISO,
+    LORA_MOSI,
+    LORA_SS
+  );
+
+  LoRa.setPins(
+    LORA_SS,
+    LORA_RST,
+    LORA_DIO0
+  );
+
+  Serial.println("[LORA] Initializing...");
+
+  if (!LoRa.begin(LORA_FREQUENCY)) {
+
+    Serial.println(
+      "[LORA] ERROR: LoRa initialization failed!"
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  // LoRa configuration
+
+  LoRa.setSpreadingFactor(7);
+
+  LoRa.setSignalBandwidth(125E3);
+
+  LoRa.setCodingRate4(5);
+
+  LoRa.enableCrc();
+
+  Serial.println("[LORA] LoRa initialized");
+
+  Serial.print("[LORA] Frequency: ");
+  Serial.println(LORA_FREQUENCY);
+
+  // ----------------------------------------------------------
+  // WIFI
+  // ----------------------------------------------------------
+
+  if (IS_GATEWAY) {
+
+    Serial.println("[GATEWAY] Gateway mode enabled");
+
+    WiFi.mode(WIFI_STA);
+
+    WiFi.begin(
+      WIFI_SSID,
+      WIFI_PASSWORD
+    );
+
+    Serial.print("[WIFI] Connecting");
+
+    int attempts = 0;
+
+    while (
+      WiFi.status() != WL_CONNECTED &&
+      attempts < 20
+    ) {
+
+      delay(500);
+
+      Serial.print(".");
+
+      attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+
+      Serial.println();
+
+      Serial.println(
+        "[WIFI] Connected!"
+      );
+
+      Serial.print(
+        "[WIFI] IP Address: "
+      );
+
+      Serial.println(
+        WiFi.localIP()
+      );
+
+    } else {
+
+      Serial.println();
+
+      Serial.println(
+        "[WIFI] Connection failed"
+      );
+    }
+
+  } else {
+
+    Serial.println(
+      "[NODE] Sensor node mode"
+    );
+  }
+
+  Serial.println();
+  Serial.println(
+    "[SYSTEM] NAHIDA node ready"
+  );
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  // ----------------------------------------------------------
+  // Continuously listen for LoRa packets
+  // ----------------------------------------------------------
+
+  receiveLoRaPackets();
+
+  // ----------------------------------------------------------
+  // Generate sensor packet periodically
+  // ----------------------------------------------------------
+
+  unsigned long currentMillis = millis();
+
+  if (
+    currentMillis - lastTransmissionTime
+    >= TRANSMISSION_INTERVAL_MS
+  ) {
+
+    lastTransmissionTime = currentMillis;
+
+    processAndTransmitSensorData();
+  }
+}
+
+// ============================================================
+// CREATE SENSOR DATA
+// ============================================================
+
+void processAndTransmitSensorData() {
+
+  Serial.println();
+  Serial.println(
+    "-----------------------------------------"
+  );
+
+  Serial.println(
+    "[SENSOR] Collecting telemetry..."
+  );
+
+  // ----------------------------------------------------------
+  // MPU6500
+  // ----------------------------------------------------------
+
+  // Replace these with actual MPU6500 readings
+  // when the sensor driver is added.
+
+  float ax = 0.05;
+  float ay = 0.98;
+  float az = 0.15;
+
+  float tilt =
+    atan2(
+      sqrt(
+        ax * ax +
+        az * az
+      ),
+      ay
+    ) *
+    180.0 /
+    PI;
+
+  // ----------------------------------------------------------
+  // SW-420
+  // ----------------------------------------------------------
+
+  int raw_vib1 =
+    analogRead(PIN_SW420_Z1);
+
+  int raw_vib2 =
+    analogRead(PIN_SW420_Z2);
+
+  int raw_vib3 =
+    analogRead(PIN_SW420_Z3);
+
+  float vibration1 =
+    (raw_vib1 / 4095.0) * 1.5;
+
+  float vibration2 =
+    (raw_vib2 / 4095.0) * 1.5;
+
+  float vibration3 =
+    (raw_vib3 / 4095.0) * 1.5;
+
+  float vibration =
+    (vibration1 +
+     vibration2 +
+     vibration3) / 3.0;
+
+  // ----------------------------------------------------------
+  // Crack displacement
+  // ----------------------------------------------------------
+
+  float crack_displacement = 0.52;
+
+  // ----------------------------------------------------------
+  // DHT11
+  // ----------------------------------------------------------
+
+  float temperature = 28.4;
+
+  float humidity = 62.0;
+
+  // ----------------------------------------------------------
+  // Battery
+  // ----------------------------------------------------------
+
+  float battery = 4.12;
+
+  // ----------------------------------------------------------
+  // GPS
+  // ----------------------------------------------------------
+
+  float latitude = 23.7957;
+
+  float longitude = 86.4304;
+
+  bool gps_fix = true;
+
+  // ----------------------------------------------------------
+  // RTC
+  // ----------------------------------------------------------
+
+  String timestampStr =
+    "2026-09-24T11:28:00Z";
+
+  // ----------------------------------------------------------
+  // Create JSON
+  // ----------------------------------------------------------
+
+  StaticJsonDocument<1024> doc;
+
+  doc["node_id"] = NODE_ID;
+
+  doc["zone"] = ZONE_NAME;
+
+  doc["timestamp"] = timestampStr;
+
+  doc["tilt"] =
+    round(tilt * 100.0) / 100.0;
+
+  doc["vibration"] =
+    round(vibration * 1000.0) / 1000.0;
+
+  doc["crack_displacement"] =
+    round(
+      crack_displacement * 100.0
+    ) / 100.0;
+
+  doc["temperature"] =
+    temperature;
+
+  doc["humidity"] =
+    humidity;
+
+  doc["latitude"] =
+    latitude;
+
+  doc["longitude"] =
+    longitude;
+
+  doc["acceleration_x"] =
+    ax;
+
+  doc["acceleration_y"] =
+    ay;
+
+  doc["acceleration_z"] =
+    az;
+
+  doc["vibration_zone_1"] =
+    vibration1;
+
+  doc["vibration_zone_2"] =
+    vibration2;
+
+  doc["vibration_zone_3"] =
+    vibration3;
+
+  doc["battery"] =
+    battery;
+
+  doc["gps_fix"] =
+    gps_fix;
+
+  doc["imu_status"] =
+    "OK";
+
+  doc["rtc_status"] =
+    "SYNCED";
+
+  doc["sd_status"] =
+    "READY";
+
+  doc["data_source"] =
+    "ESP32_LORA";
+
+  // ----------------------------------------------------------
+  // MESH METADATA
+  // ----------------------------------------------------------
+
+  String packetID =
+    createPacketID();
+
+  doc["packet_id"] =
+    packetID;
+
+  doc["source_node"] =
+    NODE_ID;
+
+  doc["hop_count"] =
+    0;
+
+  doc["max_hops"] =
+    MAX_HOPS;
+
+  doc["protocol"] =
+    "NAHIDA-LORA-MESH";
+
+  // ----------------------------------------------------------
+  // Serialize
+  // ----------------------------------------------------------
+
+  String jsonPayload;
+
+  serializeJson(
+    doc,
+    jsonPayload
+  );
+
+  Serial.println(
+    "[SENSOR] Packet created"
+  );
+
+  Serial.println(
+    jsonPayload
+  );
+
+  // Remember our own packet
+
+  rememberPacket(packetID);
+
+  // ----------------------------------------------------------
+  // GATEWAY
+  // ----------------------------------------------------------
+
+  if (IS_GATEWAY) {
+
+    if (
+      WiFi.status() ==
+      WL_CONNECTED
+    ) {
+
+      sendToServer(
+        jsonPayload
+      );
+
+    } else {
+
+      Serial.println(
+        "[GATEWAY] Wi-Fi unavailable"
+      );
+
+      logToSD(
+        jsonPayload
+      );
+    }
+
+  }
+
+  // ----------------------------------------------------------
+  // NORMAL SENSOR NODE
+  // ----------------------------------------------------------
+
+  else {
+
+    sendLoRaPacket(
+      jsonPayload
+    );
+  }
+}
+
+// ============================================================
+// SEND SENSOR DATA THROUGH LORA
+// ============================================================
+
+void sendLoRaPacket(
+  const String& payload
+) {
+
+  Serial.println(
+    "[LORA] Broadcasting telemetry..."
+  );
+
+  LoRa.beginPacket();
+
+  LoRa.print(payload);
+
+  LoRa.endPacket();
+
+  Serial.println(
+    "[LORA] Packet transmitted"
+  );
+}
+
+// ============================================================
+// RECEIVE LORA PACKETS
+// ============================================================
+
+void receiveLoRaPackets() {
+
+  int packetSize =
+    LoRa.parsePacket();
+
+  if (!packetSize) {
+    return;
+  }
+
+  String packet = "";
+
+  while (LoRa.available()) {
+
+    packet +=
+      (char)LoRa.read();
+  }
+
+  Serial.println();
+  Serial.println(
+    "[LORA] Packet received"
+  );
+
+  Serial.print(
+    "[LORA] RSSI: "
+  );
+
+  Serial.println(
+    LoRa.packetRssi()
+  );
+
+  Serial.print(
+    "[LORA] SNR: "
+  );
+
+  Serial.println(
+    LoRa.packetSnr()
+  );
+
+  processLoRaPacket(
+    packet
+  );
+}
+
+// ============================================================
+// PROCESS LORA PACKET
+// ============================================================
+
+void processLoRaPacket(
+  String packet
+) {
+
+  StaticJsonDocument<1024> doc;
+
+  DeserializationError error =
+    deserializeJson(
+      doc,
+      packet
+    );
+
+  if (error) {
+
+    Serial.println(
+      "[LORA] Invalid JSON packet"
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // Get packet metadata
+  // ----------------------------------------------------------
+
+  String packetID =
+    doc["packet_id"] |
+    "";
+
+  String sourceNode =
+    doc["source_node"] |
+    "";
+
+  int hopCount =
+    doc["hop_count"] |
+    0;
+
+  int maxHops =
+    doc["max_hops"] |
+    MAX_HOPS;
+
+  // ----------------------------------------------------------
+  // Check duplicate
+  // ----------------------------------------------------------
+
+  if (
+    packetAlreadySeen(
+      packetID
+    )
+  ) {
+
+    Serial.println(
+      "[MESH] Duplicate packet ignored"
+    );
+
+    return;
+  }
+
+  rememberPacket(
+    packetID
+  );
+
+  Serial.println(
+    "[MESH] New packet accepted"
+  );
+
+  Serial.print(
+    "[MESH] Source: "
+  );
+
+  Serial.println(
+    sourceNode
+  );
+
+  Serial.print(
+    "[MESH] Hop count: "
+  );
+
+  Serial.println(
+    hopCount
+  );
+
+  // ----------------------------------------------------------
+  // GATEWAY
+  // ----------------------------------------------------------
+
+  if (IS_GATEWAY) {
+
+    Serial.println(
+      "[GATEWAY] Packet arrived at gateway"
+    );
+
+    if (
+      WiFi.status() ==
+      WL_CONNECTED
+    ) {
+
+      sendToServer(
+        packet
+      );
+
+    } else {
+
+      Serial.println(
+        "[GATEWAY] Wi-Fi unavailable"
+      );
+
+      logToSD(
+        packet
+      );
+    }
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // NORMAL MESH NODE
+  // ----------------------------------------------------------
+
+  if (
+    hopCount >= maxHops
+  ) {
+
+    Serial.println(
+      "[MESH] Maximum hop count reached"
+    );
+
+    Serial.println(
+      "[MESH] Packet will not be forwarded"
+    );
+
+    return;
+  }
+
+  // Increase hop count
+
+  doc["hop_count"] =
+    hopCount + 1;
+
+  // Record forwarding node
+
+  doc["last_forwarded_by"] =
+    NODE_ID;
+
+  String forwardedPacket;
+
+  serializeJson(
+    doc,
+    forwardedPacket
+  );
+
+  delay(
+    random(50, 250)
+  );
+
+  forwardLoRaPacket(
+    forwardedPacket
+  );
+}
+
+// ============================================================
+// FORWARD PACKET
+// ============================================================
+
+void forwardLoRaPacket(
+  String packet
+) {
+
+  Serial.println(
+    "[MESH] Forwarding packet..."
+  );
+
+  LoRa.beginPacket();
+
+  LoRa.print(packet);
+
+  LoRa.endPacket();
+
+  Serial.println(
+    "[MESH] Packet forwarded"
+  );
+}
+
+// ============================================================
+// SEND TO FASTAPI SERVER
+// ============================================================
+
+void sendToServer(
+  String payload
+) {
+
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  ) {
+
+    Serial.println(
+      "[HTTP] Wi-Fi unavailable"
+    );
+
+    logToSD(
+      payload
+    );
+
+    return;
+  }
+
+  HTTPClient http;
+
+  http.begin(
+    SERVER_URL
+  );
+
+  http.addHeader(
+    "Content-Type",
+    "application/json"
+  );
+
+  int responseCode =
+    http.POST(
+      payload
+    );
+
+  if (
+    responseCode > 0
+  ) {
+
+    Serial.print(
+      "[HTTP] Server response: "
+    );
+
+    Serial.println(
+      responseCode
+    );
+
+    if (
+      responseCode >= 200 &&
+      responseCode < 300
+    ) {
+
+      Serial.println(
+        "[HTTP] Telemetry uploaded successfully"
+      );
+
+    } else {
+
+      Serial.println(
+        "[HTTP] Server rejected packet"
+      );
+
+      logToSD(
+        payload
+      );
+    }
+
+  } else {
+
+    Serial.print(
+      "[HTTP] POST failed: "
+    );
+
+    Serial.println(
+      http.errorToString(
+        responseCode
+      )
+    );
+
+    logToSD(
+      payload
+    );
+  }
+
+  http.end();
+}
+
+// ============================================================
+// SD CARD LOGGING
+// ============================================================
+
+void logToSD(
+  const String& data
+) {
+
+  File logFile =
+    SD.open(
+      "/telemetry_backup.jsonl",
+      FILE_APPEND
+    );
+
+  if (logFile) {
+
+    logFile.println(
+      data
+    );
+
+    logFile.close();
+
+    Serial.println(
+      "[SD] Packet stored locally"
+    );
+
+  } else {
+
+    Serial.println(
+      "[SD] ERROR: Could not open log file"
+    );
+  }
+}
+
+// ============================================================
+// PACKET ID GENERATION
+// ============================================================
+
+String createPacketID() {
+
+  String packetID =
+    String(NODE_ID);
+
+  packetID += "-";
+
+  packetID +=
+    String(millis());
+
+  packetID += "-";
+
+  packetID +=
+    String(random(1000, 9999));
+
+  return packetID;
+}
+
+// ============================================================
+// DUPLICATE PACKET DETECTION
+// ============================================================
+
+bool packetAlreadySeen(
+  String packetID
+) {
+
+  if (
+    packetID.length() == 0
+  ) {
+
+    return false;
+  }
+
+  for (
+    int i = 0;
+    i < PACKET_HISTORY_SIZE;
+    i++
+  ) {
+
+    if (
+      packetHistory[i] ==
+      packetID
+    ) {
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ============================================================
+// REMEMBER PACKET
+// ============================================================
+
+void rememberPacket(
+  String packetID
+) {
+
+  if (
+    packetID.length() == 0
+  ) {
+
+    return;
+  }
+
+  packetHistory[
+    historyIndex
+  ] = packetID;
+
+  historyIndex++;
+
+  if (
+    historyIndex >=
+    PACKET_HISTORY_SIZE
+  ) {
+
+    historyIndex = 0;
+  }
+}
